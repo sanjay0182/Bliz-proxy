@@ -54,7 +54,7 @@ function newKey(label, o = {}) {
   KEYS.set(k, r); q('INSERT INTO keys VALUES(?,?,?,0)', [k, label, now]); saveKC(r); return r;
 }
 function setCfg(b) {
-  if (b.conc) { CONC = clamp(b.conc, 100, 10000); sv('conc', CONC); }
+  if (b.conc) { CONC = clamp(b.conc, 1, 10000); sv('conc', CONC); }
   if (b.int) { INT = clamp(b.int, 1, 1440); sv('int', INT); }
   if (b.scan) { MAXSCAN = clamp(b.scan, 1, 10000); sv('scan', MAXSCAN); }
 }
@@ -161,7 +161,8 @@ const fmt = p => p.t + '://' + p.a;
 function snap(k, t) {
   const id = k.k + '|' + t, c = SNAP.get(id);
   if (c && Date.now() - c.t < k.ref * 60000) return c.l;
-  const l = alive().filter(p => !t || p.t === t).sort((a, b) => a.ms - b.ms).slice(0, k.lim);
+  const cutoff = Date.now() - k.ref * 60000;              // key ke apne 'updates every' se zyada purana check nahi chalega
+  const l = alive().filter(p => (!t || p.t === t) && p.chk >= cutoff).sort((a, b) => a.ms - b.ms).slice(0, k.lim);
   SNAP.set(id, { t: Date.now(), l }); return l;
 }
 
