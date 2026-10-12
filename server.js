@@ -1,9 +1,9 @@
 // Proxy Hub: fetch lists -> scan every few minutes (max 5000) -> API + dashboard. Persists in Blitz SQL. Zero deps (Node 20+).
-const http = require('http'), net = require('net'), crypto = require('crypto');
+const http = require('http'), net = require('net'), tls = require('tls'), crypto = require('crypto');
 const E = process.env, PORT = +E.PORT || 3000, DB = (E.DB_URL || '').replace(/\/$/, ''), PASS = E.ADMIN_PASSWORD || 'change-me';
 const SIG = k => crypto.createHmac('sha256', PASS).update(k).digest('hex');
-let CONC = +E.CONCURRENCY || 2000, INT = +E.FETCH_MINUTES || 5, TMO = +E.TIMEOUT_MS || 6000, MAXSCAN = Math.min(10000, +E.MAX_SCAN || 10000);
-const P = new Map(), DEL = new Set(), KEYS = new Map(), SNAP = new Map(); let SRC = [], WAKE = () => {};
+let CONC = +E.CONCURRENCY || 2000, INT = +E.FETCH_MINUTES || 5, TMO = +E.TIMEOUT_MS || 6000, MAXSCAN = +E.MAX_SCAN || 10000;  // no upper limit any more
+const P = new Map(), DEL = new Set(), KEYS = new Map(), SNAP = new Map(); let SRC = [], WAKE = () => {}, HSCOL = false;
 const ST = { checked: 0, t0: Date.now(), last: null, next: 0 };
 const clamp = (n, a, z) => Math.min(z, Math.max(a, Math.round(+n) || a));
 
@@ -25,7 +25,7 @@ const batch = async a => {  // try {"batch":[...]}; if DB rejects it, fall back 
   if (j && j.error) { console.log('batch failed, sequential fallback:', String(j.error).slice(0, 80)); for (const [sql, params] of a) await q(sql, params); }
 };
 const sv = (k, v) => q('INSERT OR REPLACE INTO settings VALUES(?,?)', [k, String(v)]);
-const SCHEMA = `CREATE TABLE IF NOT EXISTS proxies(addr TEXT PRIMARY KEY,t TEXT,s TEXT,ms INTEGER,chk INTEGER,seen INTEGER);
+const SCHEMA = `CREATE TABLE IF NOT EXISTS proxies(addr TEXT PRIMARY KEY,t TEXT,s TEXT,ms INTEGER,chk INTEGER,seen INTEGER,hs INTEGER);
 CREATE TABLE IF NOT EXISTS sources(url TEXT PRIMARY KEY,name TEXT,t TEXT,enabled INTEGER);
 CREATE TABLE IF NOT EXISTS keys(k TEXT PRIMARY KEY,label TEXT,created INTEGER,hits INTEGER);
 CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY,v TEXT);`;
@@ -55,7 +55,7 @@ const DEFAULT_SRC = [
 const CHUNK = { [R + 'proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt']: 10000 }, OFF = new Map();
 
 // ---------- keys (limit / expiry / refresh are stored in settings as "kc:<key>" so the old table needs no migration) ----------
-const kdef = o => { o.lim = clamp(o.lim || 100, 1, 10000); o.exp = +o.exp || 0; o.ref = clamp(o.ref || 5, 1, 1440); o.hs = (o.hs === true || o.hs === 1 || o.hs === '1') ? 1 : 0; return o; };
+const kdef = o => { o.lim = clamp(o.lim || 100, 1, 1e9); o.exp = +o.exp || 0; o.ref = clamp(o.ref || 5, 1, 1440); o.hs = (o.hs === true || o.hs === 1 || o.hs === '1') ? 1 : 0; return o; };
 const kv = k => ({ k: k.k, label: k.label, created: k.created, hits: k.hits, lim: k.lim, exp: k.exp, ref: k.ref, hs: k.hs });
 const saveKC = r => sv('kc:' + r.k, JSON.stringify({ lim: r.lim, exp: r.exp, ref: r.ref, hs: r.hs }));
 function newKey(label, o = {}) {
@@ -66,11 +66,14 @@ function newKey(label, o = {}) {
 function setCfg(b) {
   if (b.conc) { CONC = clamp(b.conc, 100, 10000); sv('conc', CONC); }
   if (b.int) { INT = clamp(b.int, 1, 1440); sv('int', INT); }
-  if (b.scan) { MAXSCAN = clamp(b.scan, 1, 10000); sv('scan', MAXSCAN); }
+  if (b.scan) { MAXSCAN = clamp(b.scan, 1, 1e9); sv('scan', MAXSCAN); }
 }
 
 async function load() {
   await post('/sql', { script: SCHEMA });
+  // older DBs: add the hs column once (so HTTPS-pass status survives a restart). If this cannot be detected, hs is simply not stored (safe fallback).
+  const hasHs = async () => rows(await q('PRAGMA table_info(proxies)')).some(c => c && c.name === 'hs');
+  HSCOL = await hasHs(); if (!HSCOL) { await q('ALTER TABLE proxies ADD COLUMN hs INTEGER'); HSCOL = await hasHs(); }
   await q('DELETE FROM sources WHERE url=?', [R + 'VPSLabCloud/VPSLab-Free-Proxy-List/main/http.txt']);
   // one-time source refresh (v2): drop stale lists (ShiftyTR, clarketm, proxifly 'all'), add the daily-updated ones
   const SRCV = 3, cur = rows(await q("SELECT v FROM settings WHERE k='srcv'"))[0];
@@ -85,16 +88,20 @@ async function load() {
   rows(await q('SELECT * FROM keys')).forEach(r => KEYS.set(r.k, r));
   if (!KEYS.size) newKey('default');
   for (const r of rows(await q('SELECT k,v FROM settings'))) {
-    if (r.k === 'conc') CONC = +r.v; if (r.k === 'int') INT = +r.v; if (r.k === 'scan') MAXSCAN = Math.min(10000, +r.v);
+    if (r.k === 'conc') CONC = +r.v; if (r.k === 'int') INT = +r.v; if (r.k === 'scan') MAXSCAN = +r.v || MAXSCAN;
     if (String(r.k).startsWith('kc:') && KEYS.has(r.k.slice(3))) { try { Object.assign(KEYS.get(r.k.slice(3)), JSON.parse(r.v)); } catch { } }
   }
   KEYS.forEach(k => kdef(k));
-  for (const r of rows(await q('SELECT * FROM proxies'))) P.set(r.addr, { a: r.addr, t: r.t, s: r.s, alive: 1, ms: r.ms, chk: 0, fail: 0, seen: r.seen, dirty: 0 });
+  for (const r of rows(await q('SELECT * FROM proxies'))) {  // DB addr is now 'type|ip:port'; old rows are plain 'ip:port' -> re-saved under the new key, old row deleted
+    const legacy = !String(r.addr).includes('|'), a = legacy ? r.addr : String(r.addr).split('|')[1], key = r.t + '|' + a;
+    P.set(key, { a, key, t: r.t, s: r.s, alive: 1, ms: r.ms, chk: 0, fail: 0, seen: r.seen, hs: r.hs ? 1 : 0, dirty: legacy ? 1 : 0 });
+    if (legacy) DEL.add(r.addr);
+  }
   console.log('loaded', P.size, 'proxies,', SRC.length, 'sources,', KEYS.size, 'keys');
 }
 async function flush() {
   const ops = [];
-  for (const p of P.values()) if (p.dirty && p.alive) { ops.push(['INSERT OR REPLACE INTO proxies VALUES(?,?,?,?,?,?)', [p.a, p.t, p.s, p.ms, p.chk, p.seen]]); p.dirty = 0; }
+  for (const p of P.values()) if (p.dirty && p.alive) { ops.push(HSCOL ? ['INSERT OR REPLACE INTO proxies(addr,t,s,ms,chk,seen,hs) VALUES(?,?,?,?,?,?,?)', [p.key, p.t, p.s, p.ms, p.chk, p.seen, p.hs ? 1 : 0]] : ['INSERT OR REPLACE INTO proxies(addr,t,s,ms,chk,seen) VALUES(?,?,?,?,?,?)', [p.key, p.t, p.s, p.ms, p.chk, p.seen]]); p.dirty = 0; }
   for (const a of DEL) ops.push(['DELETE FROM proxies WHERE addr=?', [a]]); DEL.clear();
   for (const k of KEYS.values()) if (k.hd) { ops.push(['UPDATE keys SET hits=? WHERE k=?', [k.hits, k.k]]); k.hd = 0; }
   for (let i = 0; i < ops.length; i += 100) await batch(ops.slice(i, i + 100));
@@ -124,33 +131,46 @@ async function fetchAll() {
 function fixKeys() { for (const [k, p] of [...P]) if (!k.includes('|')) { P.delete(k); p.key = p.t + '|' + p.a; P.set(p.key, p); } }
 
 // ---------- checker ----------
-// check(p) = normal liveness test (as before). check(p, true) = HTTPS test: HTTP proxy must open a CONNECT tunnel to :443, SOCKS must connect to :443.
+// check(p) = normal liveness test (handshake only, fast).
+// check(p, true) = REAL tunnel test: open the tunnel to 1.1.1.1:443, then do a full TLS handshake (certificate verified) and a real HTTPS request through it.
+// Only a proxy that really forwards data passes. (Old version stopped at the proxy's "OK" reply, so fake/broken proxies passed.)
+const TEST_SNI = E.TEST_SNI || 'one.one.one.one';
 function check(p, hs) {
   return new Promise(res => {
     const [h, pt] = p.a.split(':'), t0 = Date.now(); let done = 0, st = 0;
     const s = net.connect({ host: h, port: +pt, timeout: TMO });
-    const end = ok => { if (done) return; done = 1; s.destroy(); res(ok ? Date.now() - t0 : 0); };
+    let hard = 0;
+    const end = ok => { if (done) return; done = 1; clearTimeout(hard); s.destroy(); res(ok ? Date.now() - t0 : 0); };
+    if (hs) hard = setTimeout(() => end(0), TMO * 2);  // whole deep test must finish in 2x timeout
+    const deep = () => {  // tunnel is open: TLS handshake + real request through it
+      s.off('data', onData);
+      const t = tls.connect({ socket: s, servername: TEST_SNI });
+      t.on('secureConnect', () => t.write('GET / HTTP/1.1\r\nHost: ' + TEST_SNI + '\r\nConnection: close\r\n\r\n'));
+      t.on('data', d => end(/^HTTP\/1\.[01] \d\d\d/.test(d.toString('latin1', 0, 12))));
+      t.on('error', () => end(0)).on('close', () => end(0));
+    };
+    const onData = d => {
+      if (p.t === 'http') { const ok = (hs ? /^HTTP\/1\.[01] 200/ : /^HTTP\/1\.[01] [23]\d\d/).test(d.toString('latin1', 0, 14)); return hs && ok ? deep() : end(ok); }
+      if (p.t === 'socks4') { const ok = d[1] === 0x5a; return hs && ok ? deep() : end(ok); }
+      if (st === 0) { if (d[0] !== 5 || d[1] !== 0) return end(0); st = 1; s.write(Buffer.from(hs ? [5, 1, 0, 1, 1, 1, 1, 1, 1, 187] : [5, 1, 0, 1, 1, 1, 1, 1, 0, 80])); }
+      else { const ok = d[0] === 5 && d[1] === 0; return hs && ok ? deep() : end(ok); }
+    };
     s.on('timeout', () => end(0)).on('error', () => end(0)).on('close', () => end(0));
     s.on('connect', () => {
       if (p.t === 'http') s.write(hs ? 'CONNECT 1.1.1.1:443 HTTP/1.1\r\nHost: 1.1.1.1:443\r\n\r\n' : 'GET http://neverssl.com/ HTTP/1.1\r\nHost: neverssl.com\r\nConnection: close\r\n\r\n');
       else if (p.t === 'socks4') s.write(Buffer.from(hs ? [4, 1, 1, 187, 1, 1, 1, 1, 0] : [4, 1, 0, 80, 1, 1, 1, 1, 0]));
       else s.write(Buffer.from([5, 1, 0]));
     });
-    s.on('data', d => {
-      if (p.t === 'http') return end((hs ? /^HTTP\/1\.[01] 200/ : /^HTTP\/1\.[01] [23]\d\d/).test(d.toString('latin1', 0, 14)));
-      if (p.t === 'socks4') return end(d[1] === 0x5a);
-      if (st === 0) { if (d[0] !== 5 || d[1] !== 0) return end(0); st = 1; s.write(Buffer.from(hs ? [5, 1, 0, 1, 1, 1, 1, 1, 1, 187] : [5, 1, 0, 1, 1, 1, 1, 1, 0, 80])); }
-      else end(d[0] === 5 && d[1] === 0);
-    });
+    s.on('data', onData);
   });
 }
 async function probe(p) {
   let ms = await check(p); if (!ms && p.alive) ms = await check(p);  // one retry for proxies that were alive
   p.chk = Date.now(); ST.checked++; p.dirty = 1;
-  if (ms) { p.alive = 1; p.ms = ms; p.fail = 0; let h = await check(p, true); if (!h && p.hs) h = await check(p, true); p.hs = h ? 1 : 0; }
-  else { p.hs = 0; p.fail++; if (p.alive) { p.alive = 0; DEL.add(p.a); } if (p.fail >= 3) P.delete(p.key); }
+  if (ms) { p.alive = 1; p.ms = ms; p.fail = 0; let h = await check(p, true); if (!h && p.hs) h = await check(p, true); p.hs = h ? 1 : 0; if (h) p.ms = h; }  // ms of a deep-tested proxy = real TLS+request time, not just the handshake
+  else { p.hs = 0; p.fail++; if (p.alive) { p.alive = 0; DEL.add(p.key); } if (p.fail >= 3) P.delete(p.key); }
 }
-// One scan = at most MAXSCAN (<=10000) proxies. Alive ones are re-checked first (up to 80% of the budget), the rest goes to oldest-checked / new ones.
+// One scan = at most MAXSCAN proxies (no hard cap). Alive ones are re-checked first (up to 80% of the budget), the rest goes to oldest-checked / new ones.
 async function scan() {
   const t0 = Date.now(), al = [], ot = [];
   for (const p of P.values()) (p.alive ? al : ot).push(p);
@@ -159,6 +179,7 @@ async function scan() {
   const todo = [...al.slice(0, na), ...ot.slice(0, MAXSCAN - na)];
   let i = 0;
   await Promise.all(Array.from({ length: Math.min(CONC, todo.length) }, async () => { while (i < todo.length) await probe(todo[i++]); }));
+  SNAP.clear();  // keys get the freshly scanned list at once, not the cached one
   ST.last = { n: todo.length, alive: alive().length, secs: Math.round((Date.now() - t0) / 1000) };
   console.log('scan done:', ST.last.n, 'checked,', ST.last.alive, 'alive,', ST.last.secs + 's');
 }
@@ -173,9 +194,14 @@ async function loop() {
 }
 
 // ---------- http ----------
-const body = req => new Promise(r => { let b = ''; req.on('data', d => b += d); req.on('end', () => { try { r(JSON.parse(b || '{}')); } catch { r({}); } }); });
+const body = (req, max = 5e7) => new Promise(r => { let b = '', n = 0; req.on('data', d => { n += d.length; if (n > max) { req.destroy(); return r({}); } b += d; }); req.on('end', () => { try { r(JSON.parse(b || '{}')); } catch { r({}); } }); req.on('error', () => r({})); });
 const J = (res, o, c = 200) => { res.writeHead(c, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
-const authed = req => { const m = /sid=([a-f0-9]+)/.exec(req.headers.cookie || ''); return m && m[1] === SIG('admin'); };
+const sha = x => crypto.createHash('sha256').update(String(x)).digest(), same = (a, b) => crypto.timingSafeEqual(sha(a), sha(b));
+const authed = req => { const m = /sid=([a-f0-9]+)/.exec(req.headers.cookie || ''); return !!m && same(m[1], SIG('admin')); };
+const FAILS = new Map(), MAXFAIL = 5, LOCKMS = 15 * 60000;  // login: 5 wrong passwords per IP -> locked for 15 min
+const clientIp = req => String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',').pop().trim();
+setInterval(() => { const n = Date.now(); for (const [k, v] of FAILS) if (n - v.t > LOCKMS) FAILS.delete(k); }, 60000).unref();
+if (PASS === 'change-me') console.log('WARNING: ADMIN_PASSWORD is still the default "change-me" - set the ADMIN_PASSWORD env variable!');
 const alive = () => [...P.values()].filter(p => p.alive);
 const fmt = p => p.t + '://' + p.a;
 // each key sees a snapshot of the best (lowest ping) proxies, rebuilt every `ref` minutes
@@ -200,8 +226,14 @@ http.createServer(async (req, res) => {
     res.writeHead(200, { 'content-type': 'text/plain' }); return res.end(l.map(p => t ? p.a : fmt(p)).join('\n'));
   }
   if (path === '/login' && req.method === 'POST') {
-    const b = await body(req);
-    if (b.password === PASS) { res.setHeader('set-cookie', `sid=${SIG('admin')}; HttpOnly; Path=/; Max-Age=2592000; SameSite=Lax`); return J(res, { ok: 1 }); }
+    const b = await body(req, 4096), who = clientIp(req), f = FAILS.get(who), now = Date.now(), live = f && now - f.t < LOCKMS;
+    if (live && f.n >= MAXFAIL) return J(res, { error: 'too many wrong attempts, try again in 15 minutes' }, 429);
+    if (typeof b.password === 'string' && same(b.password, PASS)) {
+      FAILS.delete(who);
+      const sec = req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted ? '; Secure' : '';
+      res.setHeader('set-cookie', `sid=${SIG('admin')}; HttpOnly; Path=/; Max-Age=2592000; SameSite=Lax${sec}`); return J(res, { ok: 1 });
+    }
+    FAILS.set(who, { n: (live ? f.n : 0) + 1, t: now });
     return J(res, { error: 'wrong' }, 401);
   }
   if (path === '/') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); return res.end(authed(req) ? DASH : LOGIN); }
@@ -288,10 +320,10 @@ const DASH = `<!doctype html><title>Proxy Hub</title>${CSS}<h1>Proxy Hub</h1>
 <div class=card>
 <div class=f>
 <label>Name<input id=kl placeholder="e.g. my-bot"></label>
-<label>Proxies (1-10000)<input id=kn type=number min=1 max=10000 value=100></label>
+<label>Proxies (no limit)<input id=kn type=number min=1 value=500></label>
 <label>URL valid for<select id=kd><option value=1>1 day<option value=7>7 days<option value=30 selected>30 days<option value=90>90 days<option value=365>1 year<option value=0>Never expires</select></label>
 <label>Only HTTPS-pass proxies<select id=kh><option value=0 selected>No (all alive)<option value=1>Yes (HTTPS only)</select></label>
-<label>List updates every<select id=kr><option value=1>1 min<option value=5 selected>5 min<option value=10>10 min<option value=30>30 min<option value=60>1 hour</select></label>
+<label>List updates every<select id=kr><option value=1 selected>1 min<option value=5>5 min<option value=10>10 min<option value=30>30 min<option value=60>1 hour</select></label>
 </div>
 <button style="margin-top:12px;width:100%" onclick="mk()">Create key</button>
 </div>
@@ -310,7 +342,7 @@ const DASH = `<!doctype html><title>Proxy Hub</title>${CSS}<h1>Proxy Hub</h1>
 <div class=card><div class=f>
 <label>Parallel checks<input id=cc type=number></label>
 <label>Scan every (min)<input id=ii type=number></label>
-<label>Max proxies per scan (custom, up to 10000)<input id=sm type=number min=1 max=10000></label>
+<label>Max proxies per scan (no limit)<input id=sm type=number min=1></label>
 </div>
 <div class=r style="margin-top:12px"><button onclick="ss()">Save</button><button class=o onclick="sn2()">Scan now</button></div></div>
 
@@ -332,7 +364,7 @@ function mk(){A('key',{label:$('kl').value||'key',lim:$('kn').value,days:$('kd')
 function dk(i){const k=S.keys[i];if(confirm('Delete key "'+k.label+'"?\\nAnything using this URL will stop working.'))A('key',{del:k.k}).then(L)}
 function ek(i){const k=S.keys[i];
 const n=prompt('Name',k.label);if(n===null)return;
-const l=prompt('Proxies (1-10000)',k.lim);if(l===null)return;
+const l=prompt('Proxies (no limit)',k.lim);if(l===null)return;
 const d=prompt('Valid for how many days from NOW? (0 = never expires, empty = keep as is)','');if(d===null)return;
 const r=prompt('List updates every (min)',k.ref);if(r===null)return;
 const h=confirm('HTTPS-pass proxies only? OK = yes, Cancel = no (all alive)');
