@@ -34,15 +34,25 @@ const DEFAULT_SRC = [
   ['TheSpeedX http', R + 'TheSpeedX/PROXY-List/master/http.txt', 'http'],
   ['TheSpeedX socks4', R + 'TheSpeedX/PROXY-List/master/socks4.txt', 'socks4'],
   ['TheSpeedX socks5', R + 'TheSpeedX/PROXY-List/master/socks5.txt', 'socks5'],
-  ['clarketm http', R + 'clarketm/proxy-list/master/proxy-list-raw.txt', 'http'],
-  ['ShiftyTR http', R + 'ShiftyTR/Proxy-List/master/http.txt', 'http'],
-  ['ShiftyTR socks4', R + 'ShiftyTR/Proxy-List/master/socks4.txt', 'socks4'],
-  ['ShiftyTR socks5', R + 'ShiftyTR/Proxy-List/master/socks5.txt', 'socks5'],
-  ['proxifly all', R + 'proxifly/free-proxy-list/main/proxies/all/data.txt', 'http'],
   ['VPSLab http', R + 'VPSLabCloud/VPSLab-Free-Proxy-List/main/http_all.txt', 'http'],
   ['VPSLab socks4', R + 'VPSLabCloud/VPSLab-Free-Proxy-List/main/socks4_all.txt', 'socks4'],
   ['VPSLab socks5', R + 'VPSLabCloud/VPSLab-Free-Proxy-List/main/socks5_all.txt', 'socks5'],
+  ['iplocate http', R + 'iplocate/free-proxy-list/main/protocols/http.txt', 'http'],
+  ['iplocate https', R + 'iplocate/free-proxy-list/main/protocols/https.txt', 'http'],
+  ['iplocate socks4', R + 'iplocate/free-proxy-list/main/protocols/socks4.txt', 'socks4'],
+  ['iplocate socks5', R + 'iplocate/free-proxy-list/main/protocols/socks5.txt', 'socks5'],
+  ['monosans http', R + 'monosans/proxy-list/main/proxies/http.txt', 'http'],
+  ['monosans socks4', R + 'monosans/proxy-list/main/proxies/socks4.txt', 'socks4'],
+  ['monosans socks5', R + 'monosans/proxy-list/main/proxies/socks5.txt', 'socks5'],
+  ['proxifly http', R + 'proxifly/free-proxy-list/main/proxies/protocols/http/data.txt', 'http'],
+  ['proxifly socks4', R + 'proxifly/free-proxy-list/main/proxies/protocols/socks4/data.txt', 'socks4'],
+  ['proxifly socks5', R + 'proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt', 'socks5'],
+  ['ProxyScrape http', R + 'ProxyScrape/free-proxy-list/main/proxies/protocols/http/data.txt', 'http'],
+  ['ProxyScrape socks4', R + 'ProxyScrape/free-proxy-list/main/proxies/protocols/socks4/data.txt', 'socks4'],
+  ['ProxyScrape socks5', R + 'ProxyScrape/free-proxy-list/main/proxies/protocols/socks5/data.txt', 'socks5'],
 ];
+// Very big lists are read in parts: each fetch cycle takes the next CHUNK lines (wraps around), so memory stays small but over time all of it gets covered.
+const CHUNK = { [R + 'proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt']: 10000 }, OFF = new Map();
 
 // ---------- keys (limit / expiry / refresh are stored in settings as "kc:<key>" so the old table needs no migration) ----------
 const kdef = o => { o.lim = clamp(o.lim || 100, 1, 10000); o.exp = +o.exp || 0; o.ref = clamp(o.ref || 5, 1, 1440); return o; };
@@ -54,7 +64,7 @@ function newKey(label, o = {}) {
   KEYS.set(k, r); q('INSERT INTO keys VALUES(?,?,?,0)', [k, label, now]); saveKC(r); return r;
 }
 function setCfg(b) {
-  if (b.conc) { CONC = clamp(b.conc, 1, 10000); sv('conc', CONC); }
+  if (b.conc) { CONC = clamp(b.conc, 100, 10000); sv('conc', CONC); }
   if (b.int) { INT = clamp(b.int, 1, 1440); sv('int', INT); }
   if (b.scan) { MAXSCAN = clamp(b.scan, 1, 10000); sv('scan', MAXSCAN); }
 }
@@ -62,6 +72,13 @@ function setCfg(b) {
 async function load() {
   await post('/sql', { script: SCHEMA });
   await q('DELETE FROM sources WHERE url=?', [R + 'VPSLabCloud/VPSLab-Free-Proxy-List/main/http.txt']);
+  // one-time source refresh (v2): drop stale lists (ShiftyTR, clarketm, proxifly 'all'), add the daily-updated ones
+  const SRCV = 3, cur = rows(await q("SELECT v FROM settings WHERE k='srcv'"))[0];
+  if (!cur || +cur.v < SRCV) {
+    await q('DELETE FROM sources WHERE url LIKE ? OR url LIKE ? OR url=?', ['%ShiftyTR/Proxy-List/%', '%clarketm/proxy-list/%', R + 'proxifly/free-proxy-list/main/proxies/all/data.txt']);
+    for (const [name, url, t] of DEFAULT_SRC) await q('INSERT OR IGNORE INTO sources VALUES(?,?,?,1)', [url, name, t]);
+    await sv('srcv', SRCV);
+  }
   if (!rows(await q('SELECT url FROM sources')).length) for (const [name, url, t] of DEFAULT_SRC) await q('INSERT OR IGNORE INTO sources VALUES(?,?,?,1)', [url, name, t]);
   SRC = rows(await q('SELECT * FROM sources')).map(r => ({ ...r, n: 0 }));
   if (!SRC.length) SRC = DEFAULT_SRC.map(([name, url, t]) => ({ name, url, t, enabled: 1, n: 0 }));
@@ -90,7 +107,10 @@ async function fetchAll() {
   await Promise.all(SRC.filter(s => s.enabled).map(async s => {
     try {
       const txt = await (await fetch(s.url, { signal: AbortSignal.timeout(30000) })).text(); let n = 0, m; RE.lastIndex = 0;
-      while ((m = RE.exec(txt))) {
+      const all = []; while ((m = RE.exec(txt))) all.push(m);
+      let use = all; const cs = CHUNK[s.url];
+      if (cs && all.length > cs) { const off = OFF.get(s.url) || 0; use = all.slice(off, off + cs); if (use.length < cs) use = use.concat(all.slice(0, cs - use.length)); OFF.set(s.url, (off + cs) % all.length); }
+      for (m of use) {
         let t = (m[1] || s.t).toLowerCase(); if (t === 'https') t = 'http'; if (!['http', 'socks4', 'socks5'].includes(t)) continue;
         const a = m[2] + ':' + m[3], key = t + '|' + a; n++;
         if (!P.has(key)) { P.set(key, { a, key, t, s: s.name, alive: 0, ms: 0, chk: 0, fail: 0, seen: Date.now(), dirty: 0 }); added++; }
@@ -161,8 +181,7 @@ const fmt = p => p.t + '://' + p.a;
 function snap(k, t) {
   const id = k.k + '|' + t, c = SNAP.get(id);
   if (c && Date.now() - c.t < k.ref * 60000) return c.l;
-  const cutoff = Date.now() - k.ref * 60000;              // key ke apne 'updates every' se zyada purana check nahi chalega
-  const l = alive().filter(p => (!t || p.t === t) && p.chk >= cutoff).sort((a, b) => a.ms - b.ms).slice(0, k.lim);
+  const l = alive().filter(p => !t || p.t === t).sort((a, b) => a.ms - b.ms).slice(0, k.lim);
   SNAP.set(id, { t: Date.now(), l }); return l;
 }
 
