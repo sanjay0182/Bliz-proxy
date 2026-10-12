@@ -55,12 +55,12 @@ const DEFAULT_SRC = [
 const CHUNK = { [R + 'proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt']: 10000 }, OFF = new Map();
 
 // ---------- keys (limit / expiry / refresh are stored in settings as "kc:<key>" so the old table needs no migration) ----------
-const kdef = o => { o.lim = clamp(o.lim || 100, 1, 10000); o.exp = +o.exp || 0; o.ref = clamp(o.ref || 5, 1, 1440); return o; };
-const kv = k => ({ k: k.k, label: k.label, created: k.created, hits: k.hits, lim: k.lim, exp: k.exp, ref: k.ref });
-const saveKC = r => sv('kc:' + r.k, JSON.stringify({ lim: r.lim, exp: r.exp, ref: r.ref }));
+const kdef = o => { o.lim = clamp(o.lim || 100, 1, 10000); o.exp = +o.exp || 0; o.ref = clamp(o.ref || 5, 1, 1440); o.hs = (o.hs === true || o.hs === 1 || o.hs === '1') ? 1 : 0; return o; };
+const kv = k => ({ k: k.k, label: k.label, created: k.created, hits: k.hits, lim: k.lim, exp: k.exp, ref: k.ref, hs: k.hs });
+const saveKC = r => sv('kc:' + r.k, JSON.stringify({ lim: r.lim, exp: r.exp, ref: r.ref, hs: r.hs }));
 function newKey(label, o = {}) {
   const k = crypto.randomBytes(9).toString('hex'), now = Date.now(), days = Math.max(0, +o.days || 0);
-  const r = kdef({ k, label, created: now, hits: 0, lim: o.lim, exp: days ? now + days * 864e5 : 0, ref: o.ref });
+  const r = kdef({ k, label, created: now, hits: 0, lim: o.lim, exp: days ? now + days * 864e5 : 0, ref: o.ref, hs: o.hs });
   KEYS.set(k, r); q('INSERT INTO keys VALUES(?,?,?,0)', [k, label, now]); saveKC(r); return r;
 }
 function setCfg(b) {
@@ -124,21 +124,22 @@ async function fetchAll() {
 function fixKeys() { for (const [k, p] of [...P]) if (!k.includes('|')) { P.delete(k); p.key = p.t + '|' + p.a; P.set(p.key, p); } }
 
 // ---------- checker ----------
-function check(p) {
+// check(p) = normal liveness test (as before). check(p, true) = HTTPS test: HTTP proxy must open a CONNECT tunnel to :443, SOCKS must connect to :443.
+function check(p, hs) {
   return new Promise(res => {
     const [h, pt] = p.a.split(':'), t0 = Date.now(); let done = 0, st = 0;
     const s = net.connect({ host: h, port: +pt, timeout: TMO });
     const end = ok => { if (done) return; done = 1; s.destroy(); res(ok ? Date.now() - t0 : 0); };
     s.on('timeout', () => end(0)).on('error', () => end(0)).on('close', () => end(0));
     s.on('connect', () => {
-      if (p.t === 'http') s.write('GET http://neverssl.com/ HTTP/1.1\r\nHost: neverssl.com\r\nConnection: close\r\n\r\n');
-      else if (p.t === 'socks4') s.write(Buffer.from([4, 1, 0, 80, 1, 1, 1, 1, 0]));
+      if (p.t === 'http') s.write(hs ? 'CONNECT 1.1.1.1:443 HTTP/1.1\r\nHost: 1.1.1.1:443\r\n\r\n' : 'GET http://neverssl.com/ HTTP/1.1\r\nHost: neverssl.com\r\nConnection: close\r\n\r\n');
+      else if (p.t === 'socks4') s.write(Buffer.from(hs ? [4, 1, 1, 187, 1, 1, 1, 1, 0] : [4, 1, 0, 80, 1, 1, 1, 1, 0]));
       else s.write(Buffer.from([5, 1, 0]));
     });
     s.on('data', d => {
-      if (p.t === 'http') return end(/^HTTP\/1\.[01] [23]\d\d/.test(d.toString('latin1', 0, 14)));
+      if (p.t === 'http') return end((hs ? /^HTTP\/1\.[01] 200/ : /^HTTP\/1\.[01] [23]\d\d/).test(d.toString('latin1', 0, 14)));
       if (p.t === 'socks4') return end(d[1] === 0x5a);
-      if (st === 0) { if (d[0] !== 5 || d[1] !== 0) return end(0); st = 1; s.write(Buffer.from([5, 1, 0, 1, 1, 1, 1, 1, 0, 80])); }
+      if (st === 0) { if (d[0] !== 5 || d[1] !== 0) return end(0); st = 1; s.write(Buffer.from(hs ? [5, 1, 0, 1, 1, 1, 1, 1, 1, 187] : [5, 1, 0, 1, 1, 1, 1, 1, 0, 80])); }
       else end(d[0] === 5 && d[1] === 0);
     });
   });
@@ -146,8 +147,8 @@ function check(p) {
 async function probe(p) {
   let ms = await check(p); if (!ms && p.alive) ms = await check(p);  // one retry for proxies that were alive
   p.chk = Date.now(); ST.checked++; p.dirty = 1;
-  if (ms) { p.alive = 1; p.ms = ms; p.fail = 0; }
-  else { p.fail++; if (p.alive) { p.alive = 0; DEL.add(p.a); } if (p.fail >= 3) P.delete(p.key); }
+  if (ms) { p.alive = 1; p.ms = ms; p.fail = 0; let h = await check(p, true); if (!h && p.hs) h = await check(p, true); p.hs = h ? 1 : 0; }
+  else { p.hs = 0; p.fail++; if (p.alive) { p.alive = 0; DEL.add(p.a); } if (p.fail >= 3) P.delete(p.key); }
 }
 // One scan = at most MAXSCAN (<=10000) proxies. Alive ones are re-checked first (up to 80% of the budget), the rest goes to oldest-checked / new ones.
 async function scan() {
@@ -181,7 +182,7 @@ const fmt = p => p.t + '://' + p.a;
 function snap(k, t) {
   const id = k.k + '|' + t, c = SNAP.get(id);
   if (c && Date.now() - c.t < k.ref * 60000) return c.l;
-  const l = alive().filter(p => !t || p.t === t).sort((a, b) => a.ms - b.ms).slice(0, k.lim);
+  const l = alive().filter(p => (!t || p.t === t) && (!k.hs || p.hs)).sort((a, b) => a.ms - b.ms).slice(0, k.lim);
   SNAP.set(id, { t: Date.now(), l }); return l;
 }
 
@@ -195,7 +196,7 @@ http.createServer(async (req, res) => {
     let t = u.searchParams.get('type') || ''; if (!['http', 'socks4', 'socks5'].includes(t)) t = '';
     const want = Math.min(k.lim, Math.max(1, +u.searchParams.get('limit') || k.lim));
     const l = snap(k, t).slice(0, want);
-    if (u.searchParams.get('format') === 'json') return J(res, l.map(p => ({ proxy: p.a, type: p.t, ms: p.ms, source: p.s })));
+    if (u.searchParams.get('format') === 'json') return J(res, l.map(p => ({ proxy: p.a, type: p.t, ms: p.ms, https: p.hs ? 1 : 0, source: p.s })));
     res.writeHead(200, { 'content-type': 'text/plain' }); return res.end(l.map(p => t ? p.a : fmt(p)).join('\n'));
   }
   if (path === '/login' && req.method === 'POST') {
@@ -208,14 +209,14 @@ http.createServer(async (req, res) => {
   const b = req.method === 'POST' ? await body(req) : {};
   if (path === '/admin/state') {
     const a = alive(), by = t => ({ alive: a.filter(p => p.t === t).length, total: [...P.values()].filter(p => p.t === t).length });
-    return J(res, { http: by('http'), socks4: by('socks4'), socks5: by('socks5'), total: P.size, alive: a.length, checked: ST.checked, last: ST.last, next: ST.next, conc: CONC, int: INT, scanMax: MAXSCAN, src: SRC, keys: [...KEYS.values()].map(kv), top: a.sort((x, y) => x.ms - y.ms).slice(0, 40).map(p => ({ p: fmt(p), ms: p.ms, s: p.s })) });
+    return J(res, { http: by('http'), socks4: by('socks4'), socks5: by('socks5'), total: P.size, alive: a.length, hs: a.filter(p => p.hs).length, checked: ST.checked, last: ST.last, next: ST.next, conc: CONC, int: INT, scanMax: MAXSCAN, src: SRC, keys: [...KEYS.values()].map(kv), top: a.sort((x, y) => x.ms - y.ms).slice(0, 40).map(p => ({ p: fmt(p), ms: p.ms, s: p.s })) });
   }
   if (path === '/admin/key') {
     if (b.edit) {
       const k = KEYS.get(b.edit);
       if (k) {
         if (b.label) { k.label = String(b.label).slice(0, 40); q('UPDATE keys SET label=? WHERE k=?', [k.label, k.k]); }
-        if (b.lim) k.lim = b.lim; if (b.ref) k.ref = b.ref;
+        if (b.lim) k.lim = b.lim; if (b.ref) k.ref = b.ref; if (b.hs !== undefined) k.hs = b.hs;
         if (b.days !== undefined && b.days !== '') k.exp = +b.days > 0 ? Date.now() + +b.days * 864e5 : 0;
         kdef(k); saveKC(k);
         for (const x of [...SNAP.keys()]) if (x.startsWith(k.k + '|')) SNAP.delete(x);
@@ -242,7 +243,7 @@ http.createServer(async (req, res) => {
     (b.sources || []).forEach(s => { if (s.url && !SRC.find(x => x.url === s.url)) { SRC.push({ ...s, enabled: 1, n: 0 }); q('INSERT OR IGNORE INTO sources VALUES(?,?,?,1)', [s.url, s.name, s.t]); } });
     (b.keys || []).forEach(k => {
       if (!k.k || KEYS.has(k.k)) return;
-      const o = kdef({ k: k.k, label: k.label || 'key', created: k.created || Date.now(), hits: k.hits || 0, lim: k.lim, exp: k.exp, ref: k.ref });
+      const o = kdef({ k: k.k, label: k.label || 'key', created: k.created || Date.now(), hits: k.hits || 0, lim: k.lim, exp: k.exp, ref: k.ref, hs: k.hs });
       KEYS.set(o.k, o); q('INSERT OR IGNORE INTO keys VALUES(?,?,?,?)', [o.k, o.label, o.created, o.hits]); saveKC(o);
     });
     (b.proxies || []).forEach(p => { const key = p.t + '|' + p.a; if (!P.has(key)) P.set(key, { ...p, key, alive: 0, chk: 0, fail: 0, seen: Date.now(), dirty: 0 }); });
@@ -289,6 +290,7 @@ const DASH = `<!doctype html><title>Proxy Hub</title>${CSS}<h1>Proxy Hub</h1>
 <label>Name<input id=kl placeholder="e.g. my-bot"></label>
 <label>Proxies (1-10000)<input id=kn type=number min=1 max=10000 value=100></label>
 <label>URL valid for<select id=kd><option value=1>1 day<option value=7>7 days<option value=30 selected>30 days<option value=90>90 days<option value=365>1 year<option value=0>Never expires</select></label>
+<label>Only HTTPS-pass proxies<select id=kh><option value=0 selected>No (all alive)<option value=1>Yes (HTTPS only)</select></label>
 <label>List updates every<select id=kr><option value=1>1 min<option value=5 selected>5 min<option value=10>10 min<option value=30>30 min<option value=60>1 hour</select></label>
 </div>
 <button style="margin-top:12px;width:100%" onclick="mk()">Create key</button>
@@ -326,14 +328,15 @@ const $=i=>document.getElementById(i),O=location.origin;let S=null;
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const A=(p,b)=>fetch('/admin/'+p,{method:'POST',body:JSON.stringify(b||{})}).then(r=>r.json()).then(j=>{if(j.error)alert(j.error);return j});
 const ago=ms=>{const m=Math.round(ms/60000);return m<60?m+' min':m<1440?Math.round(m/60)+' h':Math.round(m/1440)+' days'};
-function mk(){A('key',{label:$('kl').value||'key',lim:$('kn').value,days:$('kd').value,ref:$('kr').value}).then(()=>{$('kl').value='';L()})}
+function mk(){A('key',{label:$('kl').value||'key',lim:$('kn').value,days:$('kd').value,ref:$('kr').value,hs:$('kh').value}).then(()=>{$('kl').value='';L()})}
 function dk(i){const k=S.keys[i];if(confirm('Delete key "'+k.label+'"?\\nAnything using this URL will stop working.'))A('key',{del:k.k}).then(L)}
 function ek(i){const k=S.keys[i];
 const n=prompt('Name',k.label);if(n===null)return;
 const l=prompt('Proxies (1-10000)',k.lim);if(l===null)return;
 const d=prompt('Valid for how many days from NOW? (0 = never expires, empty = keep as is)','');if(d===null)return;
 const r=prompt('List updates every (min)',k.ref);if(r===null)return;
-A('key',{edit:k.k,label:n,lim:l,days:d,ref:r}).then(L)}
+const h=confirm('HTTPS-pass proxies only? OK = yes, Cancel = no (all alive)');
+A('key',{edit:k.k,label:n,lim:l,days:d,ref:r,hs:h?1:0}).then(L)}
 function cp(i){const u=O+'/api/proxies?key='+S.keys[i].k;(navigator.clipboard?navigator.clipboard.writeText(u):Promise.reject()).then(()=>alert('Copied')).catch(()=>prompt('Copy this URL:',u))}
 function as(){A('source',{name:$('sn').value,url:$('su').value,t:$('stt').value}).then(()=>{$('sn').value='';$('su').value='';L()})}
 function ds(i){const x=S.src[i];if(confirm('Delete source "'+x.name+'"?'))A('source',{del:x.url}).then(L)}
@@ -343,10 +346,10 @@ function rs(){const f=$('rf').files[0];if(!f)return alert('Choose a backup file 
 if(!confirm('Restore from "'+f.name+'"?\\nSources, keys and proxies will be merged in.'))return;
 f.text().then(t=>{let j;try{j=JSON.parse(t)}catch(e){return alert('Invalid backup file')}A('restore',j).then(()=>{$('rf').value='';alert('Restored');L()})})}
 function draw(){const s=S,now=Date.now();
-$('st').innerHTML=[['Alive',s.alive+' / '+s.total],['HTTP',s.http.alive],['SOCKS4',s.socks4.alive],['SOCKS5',s.socks5.alive],['Last scan',s.last?s.last.n+' in '+s.last.secs+'s':'-'],['Next scan',s.next?Math.max(0,Math.round((s.next-now)/1000))+'s':'scanning...']].map(x=>'<div class=c><small>'+x[0]+'</small><b>'+x[1]+'</b></div>').join('');
+$('st').innerHTML=[['Alive',s.alive+' / '+s.total],['HTTPS ok',s.hs],['HTTP',s.http.alive],['SOCKS4',s.socks4.alive],['SOCKS5',s.socks5.alive],['Last scan',s.last?s.last.n+' in '+s.last.secs+'s':'-'],['Next scan',s.next?Math.max(0,Math.round((s.next-now)/1000))+'s':'scanning...']].map(x=>'<div class=c><small>'+x[0]+'</small><b>'+x[1]+'</b></div>').join('');
 $('keys').innerHTML=s.keys.map((k,i)=>{const dead=k.exp&&k.exp<now;
 const ex=!k.exp?'never expires':dead?'<b style="color:#dc2626">EXPIRED</b>':'expires '+new Date(k.exp).toLocaleDateString()+' ('+ago(k.exp-now)+' left)';
-return '<div class=card><div class=r><b style="flex:1">'+esc(k.label)+'</b><button class=o onclick="cp('+i+')">Copy URL</button><button class=o onclick="ek('+i+')">Edit</button><button class=x onclick="dk('+i+')">Delete</button></div><small>'+k.lim+' proxies &middot; updates every '+k.ref+' min &middot; '+ex+' &middot; '+k.hits+' hits</small><div class=u>'+esc(O+'/api/proxies?key='+k.k)+'</div></div>'}).join('');
+return '<div class=card><div class=r><b style="flex:1">'+esc(k.label)+'</b><button class=o onclick="cp('+i+')">Copy URL</button><button class=o onclick="ek('+i+')">Edit</button><button class=x onclick="dk('+i+')">Delete</button></div><small>'+k.lim+' proxies &middot; '+(k.hs?'HTTPS only &middot; ':'')+'updates every '+k.ref+' min &middot; '+ex+' &middot; '+k.hits+' hits</small><div class=u>'+esc(O+'/api/proxies?key='+k.k)+'</div></div>'}).join('');
 $('src').innerHTML=s.src.map((x,i)=>'<div class="r l"><span style="flex:1;word-break:break-all">'+esc(x.name)+' <small>['+x.t+'] '+x.n+' found '+esc(x.err||'')+'</small></span><button class=x onclick="ds('+i+')">Delete</button></div>').join('');
 $('fast').innerHTML=s.top.map(x=>'<div class="r l"><span style="flex:1;word-break:break-all">'+esc(x.p)+'</span><small>'+x.ms+' ms</small></div>').join('');
 ['cc','ii','sm'].forEach((id,i)=>{if(document.activeElement.id!==id)$(id).value=[s.conc,s.int,s.scanMax][i]})}
